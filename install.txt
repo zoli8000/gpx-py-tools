@@ -1,0 +1,5 @@
+Create venv
+
+Install
+.\.venv\Scripts\pip.exe install --upgrade pip
+.\.venv\Scripts\pip.exe install numpy pandas Pillow boto3
