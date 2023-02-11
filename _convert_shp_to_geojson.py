@@ -3,7 +3,12 @@
 Created on Thu Feb  2 20:58:15 2023
 @author: zoltan
 
-Data from Openstreetmap Admin Boundaries
+Data from Openstreetmap Admin Boundaries.
+Converts gps positions (EPSG:4326) to compressed meter-based EPSG:23700.
+Each coordinate is stored on 12 bit pairs.
+The 12 bit data is stored similar to base64, 0x40 is added to the 6bit value.
+If the result is a special character, values '0'..'9' are used for special values.
+
 """
 
 data = """

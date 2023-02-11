@@ -25,5 +25,5 @@ for i in range(0, len(data), 4):
     
     converted.append(num)
     
-with open("F:/tmp_bp/admin_utcak25.raw", "wb") as f:
+with open("F:/tmp_bp/admin_roads25.raw", "wb") as f:
     f.write(bytes(converted))
