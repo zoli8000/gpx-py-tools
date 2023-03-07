@@ -15,6 +15,10 @@ import pandas as pd
 
 from PIL import Image, ImageDraw
 from collections import Counter
+from datetime import date, timedelta
+
+# Save np array as an image
+from gps_utils import save_array_to_rgba_image, convert_gps_to_23700
 
 BUCKET_NAME='budapest-challenge-szz-2023'
 
@@ -23,32 +27,58 @@ ONE_DRIVE_PATH = os.environ['ONEDRIVE']
 BASE_PATH = rf"{ONE_DRIVE_PATH}/tmp_bp"
 
 # GPS route data in xml format
-GPS_DATA_PATH = rf"{BASE_PATH}/gpx_all.gpx"
+GPS_DATA_PATH = rf"{BASE_PATH}/gpx_all.csv"
 
 # Source images with street and admin boundary info
 ADMIN_DATA_PATH = rf"{BASE_PATH}/admin_data.csv"
-ADMIN_ROADS_PATH = rf"{BASE_PATH}/admin_roads25.raw"
+ADMIN_ROADS_PATH = rf"{BASE_PATH}/admin_roads25.png"
+ADMIN_ZONES_PATH = rf"{BASE_PATH}/admin_boundaries25.png"
 
 # Output images and data tables
 SMALL_PIC_PATH = rf"{BASE_PATH}/result_small.png"
 LARGE_PIC_PATH = rf"{BASE_PATH}/result.png"
+DATE_PIC_PATH = rf"{BASE_PATH}/date_result.png"
 JSON_DATA_PATH = rf"{BASE_PATH}/routes_done.json"
+DATE_DATA_PATH = rf"{BASE_PATH}/date_stats.json"
 
 # Image size
-ROWS = 1168
-COLUMNS = 1232
+ROWS = 1180 # 1168
+COLUMNS = 1240 # 1232
 
 # Colors
-COLORS = [(0,0,0,0), (0x80, 0, 0, 0xff), (0, 0x80, 0, 0xff), (0xff, 0xff, 0, 0xff)]
+COLORS = [
+            (0, 0, 0, 0), (0x80, 0, 0, 0xff), (0, 0x80, 0, 0xff), # Transparent, red, green 
+            (0x80, 0xff, 0, 0xff),  (0xff, 0xff, 0, 0xff), (0xff, 0x80, 0, 0xff) # lime, yellow, orange
+        ]
+
+# Rasterized date info: days since 2000.01.01.
+BASE_DATE = date(2000, 1, 1)
 
 # Global file data
-gps_data, admin_roads = ["", ""]
+admin_roads = ["", ""]
 
-# Numpy Arrays, dataframes
+# Zone pixels, 25x25m, 1 band
+admin_zones = []
+
+# Administrative data
 df_admin_data:          'pd.DataFrame' = None
-np_routes_all:          'np.NDArray' = None
-np_routes_done_clean:   'np.NDArray' = None
-np_route_detailed_8bit: 'np.NDArray' = None
+
+# Gps polyline data with dates and coordinates
+df_gps_data:            'pd.DataFrame' = None
+
+# np array containing all possible residential roads by zone, 8bit value, zones are 1..255
+np_visitable_byzones_uint8:  'np.NDArray' = None
+
+# np array - is it visited? 0: not yet, 1: visited. stored as uint8 
+np_isdone_uint8:             'np.NDArray' = None
+
+# visited pixels by first visit date, uint32, data in band 1 and 2
+np_visited_bydate_uint32:    'np.NDArray' = None
+
+# visited pixels, with zone info, uint8
+np_visited_byzones_uint8:    'np.NDArray' = None
+
+
 
 def load_local_files():
     """ Read files:
@@ -56,110 +86,112 @@ def load_local_files():
             * admin_data:  administrative data (rasterized admin boundaries)
             * admin_roads: road data (rasterized)"""
 
-    global gps_data, df_admin_data, admin_roads
+    global df_gps_data, df_admin_data, admin_roads, admin_zones
 
 
     print(f"Reading {GPS_DATA_PATH}...")
 
-    with open(GPS_DATA_PATH, "r") as f:
-        gps_data = f.read()
+    df_gps_data = pd.read_csv(GPS_DATA_PATH, sep=",", dtype=str)  
 
     print(f"Reading {ADMIN_DATA_PATH}...")
     df_admin_data = pd.read_csv(ADMIN_DATA_PATH, sep=";")    
 
     print(f"Reading {ADMIN_ROADS_PATH}...")
-    with open(ADMIN_ROADS_PATH, "rb") as f:
-        admin_roads = f.read()
+    admin_roads_png = Image.open(ADMIN_ROADS_PATH)
+    admin_roads = list(admin_roads_png.getdata())
+
+    print(f"Reading {ADMIN_ZONES_PATH}...")
+    admin_zones_png = Image.open(ADMIN_ZONES_PATH)
+    admin_zones = list(admin_zones_png.getdata())
+
     
 
-def convert_from_gps_to_23700(lat, lon):
-    """ Simplified convert from (EPSG:4326) to compressed meter-based EPSG:23700. """
-    ymulti = 111188 # (max_my / max_gpsy)
-    xmulti = 75334 # (max_mx / max_gpsx)
-
-    lon23700 = (lat - 47.144433) * ymulti + 200029
-    lat23700 = (lon - 18.931005) * xmulti + 641228
-
-    # print(lon23700, lat23700)
-    return [lon23700, lat23700]
-
-def convert_from_gps_to_pixel(lat, lon):
+def convert_gps_to_pixel(lat, lon):
     """ Convert gps coordinates to pixel coordinate in image """
-    lat2, lon2 = convert_from_gps_to_23700(lat, lon)
+    lat2, lon2 = convert_gps_to_23700(lat, lon)
     
     latp = (252143 - lat2) / 25
     lonp = (lon2 - 640790.6) / 25
     
     return [lonp, latp]
 
-def save_array_to_rgba_image(np_array, dest_path):
-    """ Save np array as an RGBA image """
-    print(f"Saving image as {dest_path}...")
-    img = Image.fromarray(np_array, "RGBA")
-    img.save(dest_path)
+
 
 def get_rasterized_from_gps():
     """ Rasterizes a GPX file, the result is an array of numbers with 0 and 1 pixels. """
     
     print(f"Rasterizing gpx file...")
 
-    routes_walked_image = Image.new("1", (COLUMNS, ROWS), 0)
+    routes_walked_image = Image.new("RGBA", (COLUMNS, ROWS), 0)
     routes_walked_draw = ImageDraw.Draw(routes_walked_image) 
     end = 0
 
-    while True:
-        # Find segment start end end
-        start = gps_data.find("<trkseg>", end)    
-        if start == -1: break
-        end = gps_data.find("</trkseg>", start)
-        
-        # Segment data
-        block = gps_data[start + len("<trkseg>"):end - len("</trkseg>")]
-        
-        last_lat = -1
-        last_lon = -1
-        
-        # All lat-lon coordinates in segment
-        for line in block.split("\n"):
-            m = re.match(r""".*lat=\"(?P<lat>[\d.]+)\" lon=\"(?P<lon>[\d.]+)\">.*""", line)
-            if not m: continue
-        
-            md = m.groupdict()
-            
-            lat = md['lat']
-            lon = md['lon']
-            
-            pix_lat, pix_lon = convert_from_gps_to_pixel(float(lat), float(lon))
-            
-            shape = [(last_lat, last_lon), (pix_lat, pix_lon)]
-            
-            if (last_lat > 0 and last_lon > 0):
-                routes_walked_draw.line(shape, fill =1, width = 3)
-            
-            last_lat = pix_lat
-            last_lon = pix_lon
-            # print(lat, lon)
+    for index, row in df_gps_data.iterrows():
+        pix_lat0, pix_lon0 = convert_gps_to_pixel(float(row['lat0']), float(row['lon0']))
+        pix_lat1, pix_lon1 = convert_gps_to_pixel(float(row['lat1']), float(row['lon1']))
 
-    
-    return list(routes_walked_image.getdata())
+        shape = [(pix_lat0, pix_lon0), (pix_lat1, pix_lon1)]
+        walk_date = date(int(row['edate'][:4]), int(row['edate'][4:6]), int(row['edate'][6:8]))
+        delta = (walk_date - BASE_DATE).days
+        color = (delta >> 16, (delta >> 8) & 0xff, delta & 0xff)
+        routes_walked_draw.line(shape, fill=color, width=3)
+
+    # routes_walked_image.save(DATE_PIC_PATH) 
+    np_dates = np.array(routes_walked_image.getdata(1))*0x100 + np.array(routes_walked_image.getdata(2)) 
+
+    return np.array(np_dates, dtype='uint32')
 
 def create_aggr_table():
     """ Set road length by administrative areas in the admin_data table """
     
-    global np_routes_all, np_routes_done_clean
+    global np_visitable_byzones_uint8, np_isdone_uint8, np_visited_bydate_uint32
 
-    np_routes_all = np.array(list(admin_roads), dtype='uint8')
-    count_zones_all = Counter(np_routes_all)
+    np_visitable_byzones_uint8 = np.array(admin_roads, dtype='uint8')
+    np_zone_data_uint8 = np.array(admin_zones, dtype='uint8')
+
+    count_zones_all = Counter(np_visitable_byzones_uint8)
 
     df_admin_data['Total'] = df_admin_data['ID'].apply(lambda x: count_zones_all.get(x, 0))
 
     # Rasterize gps data, and keep only pixels in the proximity of residential roads.
-    rasterized_gpx = get_rasterized_from_gps()
-    np_routes_done = np.array(rasterized_gpx, dtype='uint8')
-    np_routes_done_clean = (np_routes_all > 0) * (np_routes_done)
+    np_visited_bydate_uint32_raw = get_rasterized_from_gps() 
+    np_visited_bydate_uint32_raw[np_visited_bydate_uint32_raw == 0] = 0xff00ffff
+    np_visited_bydate_uint32 = np_visited_bydate_uint32_raw * (np_visitable_byzones_uint8 > 0)
+    np_isdone_uint8 = (np_visited_bydate_uint32 > 0) & (np_visited_bydate_uint32 < 0xffff)
+
+
+    # Save image - date info as RG, and zone info as B.
+    # Kept a distinct file for zone data, size is not less with a single png file.
+    # tmp_img_data = (np_visited_bydate_uint32  + 0xff000000) + np_zone_data_uint8 * 0x10000
+    tmp_img_data = (np_visited_bydate_uint32  + 0xff000000) + np_visitable_byzones_uint8 * 0x10000
+    tmp_img_rgb = tmp_img_data.view(dtype='uint8').reshape((ROWS, COLUMNS, 4))
+    save_array_to_rgba_image(tmp_img_rgb, DATE_PIC_PATH, "RGBA")
+    
+    min_date = 0
+    # Get zone data
+
+    """
+    zone_data = {}
+    for zone_id in range(1, len(count_zones_all)):
+        np_visited_bydate_actzone = np_visited_bydate_uint32_raw * (np_visitable_byzones_uint8 == zone_id)
+        date_list = Counter(np_visited_bydate_actzone)
+        zone_data[zone_id] = date_list
+    """
+
+    date_pixels = Counter(np_visited_bydate_uint32)
+    corrected_dict = {}
+
+    for k, v in date_pixels.items():
+        corrected_date = BASE_DATE + timedelta(days=int(k) & 0xffff)
+        corrected_dict[corrected_date] = v
+
+    # Write aggregated data
+    df_date_freq = pd.DataFrame({'date': corrected_dict.keys(), 'freq': corrected_dict.values()})
+    df_date_freq['date'] = df_date_freq['date'].map(lambda d: d.strftime("%Y%m%d"))
+    df_date_freq.to_json(DATE_DATA_PATH, orient='records')
 
     # Get finished pixels in each zone
-    np_routes_done_zones = (np_routes_all) * (np_routes_done_clean)
+    np_routes_done_zones = np_visitable_byzones_uint8 * np_isdone_uint8
     count_zones_done = Counter(np_routes_done_zones)
 
     # Add done and percentage finished to admin_data table
@@ -170,16 +202,16 @@ def create_aggr_table():
     df_admin_data.to_json(JSON_DATA_PATH, orient='records')
 
 def create_large_result():
-    global np_route_detailed_8bit
+    global np_visited_byzones_uint8
     
     # Create colored map, red: not visited, green: completely visited, yellow: partially visited 
-    np_route_detailed_8bit = (np_routes_all > 0) * (np_routes_done_clean + 1)
-    np_result_rgba = list(map(lambda x: COLORS[x], np_route_detailed_8bit))
+    np_visited_byzones_uint8 = (np_visitable_byzones_uint8 > 0) * (np_isdone_uint8 + 1)
+    np_result_rgba = list(map(lambda x: COLORS[x], np_visited_byzones_uint8))
 
     np_res_reshaped = np.array(np_result_rgba, dtype='uint8').reshape((ROWS, COLUMNS, 4))
 
     # Save image
-    save_array_to_rgba_image(np_res_reshaped, LARGE_PIC_PATH)
+    save_array_to_rgba_image(np_res_reshaped, LARGE_PIC_PATH, "RGBA")
 
 def get_downscaled(np_source):
     """ Get a the downscaled list of numbers from the numpy array """
@@ -190,8 +222,9 @@ def get_downscaled(np_source):
         for column in range(0, COLUMNS, 20):
             boxData = np.array([], dtype='uint8')
             for line in range(20):
-                pixelcount = 20 if column + 20 <= COLUMNS else COLUMNS % 20
-                sourceData = np_source[row * COLUMNS + column + line : row * COLUMNS + column + line + pixelcount]
+                pixelcount = 20
+                start = (row + line) *  COLUMNS + column
+                sourceData = np_source[start : start + pixelcount]
                 boxData = np.concatenate([sourceData, boxData])
             
             pixels = Counter(boxData)
@@ -203,9 +236,11 @@ def get_downscaled(np_source):
             # print(row, column, pixels, doneShare)
             new_pixel_color = 0
             
-            if (all_done + to_be_done < 2): new_pixel_color = 0
-            elif (done_ratio > 0.90 ): new_pixel_color = 2
-            elif (done_ratio > 0.3): new_pixel_color = 3
+            if (all_done + to_be_done < 10): new_pixel_color = 0
+            elif (done_ratio > 0.90): new_pixel_color = 2
+            elif (done_ratio > 0.7): new_pixel_color = 3
+            elif (done_ratio > 0.4): new_pixel_color = 4
+            elif (done_ratio > 0.1): new_pixel_color = 5
             else: new_pixel_color = 1
             
             new_pixels.append(new_pixel_color) 
@@ -214,19 +249,39 @@ def get_downscaled(np_source):
 def create_small_result():
     """ Create downscaled color map from 8bit numpy array """
 
-    downscaled_list = get_downscaled(np_route_detailed_8bit)
+    downscaled_list = get_downscaled(np_visited_byzones_uint8)
     
     # Convert values 0-2 to RGBA colors, and reshape flat list to 59x62 image
     rgba_list = list(map(lambda x: COLORS[x], downscaled_list))
     np_small_reshaped = np.array(rgba_list, dtype='uint8').reshape((59, 62, 4))
 
     save_array_to_rgba_image(np_small_reshaped, SMALL_PIC_PATH)
-      
+
+def convert_admin_data():
+    zonedata = df_admin_data['Side'].str.slice(0, 1) +\
+               df_admin_data['District'].str.replace(". kerület", "", regex=False) + \
+               ";" + df_admin_data['Citypart']
+
+    zoneraw = []
+
+    for i in range(1, 204): 
+        zoneline = zonedata[df_admin_data['ID'] == i]
+        if len(zoneline) == 0:
+            zoneraw.append("")
+        else:
+            zoneraw.append(zoneline.iloc[0])
+            
+    with open(rf"{BASE_PATH}/zonedatastr.txt", "w") as f:
+        f.write("|".join(zoneraw))
+
+
+
 def write_to_s3():
     """ Write data to s3 """
     import boto3
     s3 = boto3.client('s3')
 
+    """
     print("Uploading 'result_small.png' to S3...")
     s3.upload_file(SMALL_PIC_PATH, Bucket=BUCKET_NAME, Key="result_small.png")
     
@@ -236,14 +291,26 @@ def write_to_s3():
     print("Uploading 'routes_done.json' to S3...")
     s3.upload_file(JSON_DATA_PATH, Bucket=BUCKET_NAME, Key="routes_done.json")
 
+    print("Uploading 'date_stats.json' to S3...")
+    s3.upload_file(DATE_DATA_PATH, Bucket=BUCKET_NAME, Key="date_stats.json")
+    """
+
+    print("Uploading 'date_result.png' to S3...")
+    s3.upload_file(DATE_PIC_PATH, Bucket=BUCKET_NAME, Key="date_result.png")
+    
 def create_files(write_s3: bool):
     """ Main function, creates files """
     load_local_files()
+    convert_admin_data()
     create_aggr_table()
     create_large_result()
     create_small_result()
 
-    if (write_s3): write_to_s3()
+    if (write_s3):
+        print("Saving to s3.") 
+        write_to_s3()
+    else:
+        print("Saving to s3 disabled.")
 
     print("Done.")
 
